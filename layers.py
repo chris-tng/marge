@@ -2,8 +2,8 @@ from flax import linen as nn
 from jax import numpy as jnp
 
 
-class FFN(nn.Module):
-    """FFN with Gates Linear Units and GELU activation
+class FeedForward(nn.Module):
+    """Position-wise FeedForward with Gates Linear Units and GELU activation
     as in https://arxiv.org/pdf/2002.05202.pdf
     """
     multiplicative: int = 4  # d_ff / d_model
@@ -18,7 +18,7 @@ class FFN(nn.Module):
 
         gate = nn.Dense(d_ff, use_bias=False, name="wi_0")(x)
         x = nn.Dense(d_ff, use_bias=False, name="wi_1")(x)
-        x = nn.gelu(x, approximate=True)
+        x = nn.gelu(gate, approximate=True) * x
         x = nn.Dropout(rate=self.dropout_rate, name="dropout")(x)
         x = nn.Dense(d_model, use_bias=False, name="wo")(x)
         return x
@@ -125,3 +125,121 @@ class CrossAttention(nn.Module):
         context = nn.Dense(d, name="out_projection")(context)
         
         return context, attention_pre_doc_sim
+
+
+class SubLayer(nn.Module):
+    num_heads: int
+    ff_multiplicative: int = 4
+    causal: bool = False
+    attention_dropout: float = 0.
+    ff_dropout: float = 0.
+
+    def setup(self):
+        self.ln0 = nn.LayerNorm()
+        self.self_attn = SelfAttention(num_heads=self.num_heads, causal=self.causal, dropout_rate=self.attention_dropout)
+        self.ln1 = nn.LayerNorm()
+        self.ffn = FeedForward(multiplicative=self.ff_multiplicative, dropout_rate=self.ff_dropout)
+
+    def __call__(self, x, attention_mask = None):
+        x = self.self_attn(self.ln0(x), attention_mask) + x
+        x = self.ffn(self.ln1(x)) + x
+        return x
+    
+
+class Encoder(nn.Module):
+    N: int
+    num_heads: int
+    N_retrieval: int = 4  # first 4 layers of the encoder (paper)
+    ff_multiplicative: int = 4
+    attention_dropout: float = 0.
+    ff_dropout: float = 0.
+
+    def setup(self):
+        self.retrieval = [
+            SubLayer(num_heads=self.num_heads, ff_multiplicative=self.ff_multiplicative, 
+                     attention_dropout=self.attention_dropout, 
+                     ff_dropout=self.ff_dropout)
+            for i in range(self.N_retrieval)
+        ]
+        self.encoder_tail = [
+            SubLayer(num_heads=self.num_heads, ff_multiplicative=self.ff_multiplicative, 
+                     attention_dropout=self.attention_dropout, 
+                     ff_dropout=self.ff_dropout)
+            for i in range(self.N - self.N_retrieval)          
+        ]
+
+    def __call__(self, x, src_mask = None, only_retrieval = False):        
+        for layer in self.retrieval:
+            x = layer(x, attention_mask = src_mask)
+
+        if only_retrieval:
+            return x
+
+        for layer in self.encoder_tail:
+            x = layer(x, attention_mask = src_mask)
+
+        return x
+    
+
+class DecoderSubLayer(nn.Module):
+    "same as SubLayer with an addition of CrossAttention"
+    num_heads: int
+    causal : bool = True
+    ff_multiplicative: int = 4
+    attention_dropout: float = 0.
+    ff_dropout: float = 0.
+
+    def setup(self):
+        self.ln0 = nn.LayerNorm()
+        self.self_attn = SelfAttention(num_heads=self.num_heads, causal=self.causal, dropout_rate=self.attention_dropout)
+        self.ln1 = nn.LayerNorm()
+        self.ffn0 = FeedForward(multiplicative=4, dropout_rate=self.ff_dropout)
+        self.cross_attn = CrossAttention(num_heads=self.num_heads, dropout_rate=self.attention_dropout)
+        # larger ffn post-cross attn
+        self.ffn1 = FeedForward(multiplicative=self.ff_multiplicative, dropout_rate=self.ff_dropout)
+
+    def __call__(self, x, context, similarities, src_mask = None, context_mask = None):
+        x = self.self_attn(self.ln0(x), src_mask) + x
+        x = self.ffn(self.ln1(x)) + x
+        x_out, attn = self.cross_attn(x, context, similarities, src_mask = src_mask, context_mask = context_mask)
+        x = x_out + x
+        x = self.ffn1(x) + x
+        return x, attn
+
+
+class Decoder(nn.Module):
+    N: int
+    N_head: int   # d 4 additional Transformer layers to the base of the decoder with only self-attention and
+    # feedforward layers of size 4096
+    num_heads: int
+    ff_multiplicative: int
+    attention_dropout: float = 0.
+    ff_dropout: float = 0.
+
+    def setup(self):
+        self.decoder_head = [
+            SubLayer(num_heads=self.num_heads, ff_multiplicative=self.ff_multiplicative, 
+                     causal=True,
+                     attention_dropout=self.attention_dropout, 
+                     ff_dropout=self.ff_dropout)
+            for i in range(self.N_head)   
+        ]
+        
+        self.decoder_tail = [
+            SubLayer(num_heads=self.num_heads, ff_multiplicative=self.ff_multiplicative, 
+                     attention_dropout=self.attention_dropout, 
+                     ff_dropout=self.ff_dropout)
+            for i in range(self.N - self.N_head)   
+        ]
+    
+    def __call__(self, x, context, similarities, src_mask = None, context_mask = None):
+        for layer in self.decoder_head:
+            x = layer(x)
+            
+        cross_pre_attns = []
+        for layer in self.decoder_tail:
+            x, cross_attn = layer(x)
+            cross_pre_attns.append(cross_attn)
+        
+        return x, cross_pre_attns
+        
